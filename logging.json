@@ -1,0 +1,6 @@
+{
+  "level": "DEBUG",
+  "file": "logs/archive-it.log",
+  "max_bytes": 5242880,
+  "retained_files": 5
+}
