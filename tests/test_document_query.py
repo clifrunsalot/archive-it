@@ -63,6 +63,68 @@ def test_factual_plan_uses_original_question_if_model_omits_search_intent(sessio
     assert result.search_question == "What is the monthly rent?"
 
 
+@pytest.mark.parametrize(
+    ("question", "search_question", "expanded"),
+    [
+        ("What are the early termination terms?", "early termination terms", True),
+        ("What is the early termination fee?", "early termination fee", False),
+    ],
+)
+def test_broad_terms_question_expands_retrieval_facets(session, question, search_question, expanded):
+    service, planner, _, _ = session
+    planner.return_value = plan_message(search_question=search_question)
+    service.search.answer = Mock(return_value=AnswerResult("Answer [1]", [], {}))
+
+    service.execute(question)
+
+    answer_question = service.search.answer.call_args.args[0]
+    search_questions = service.search.answer.call_args.kwargs["search_questions"]
+    assert ("five labeled fields" in answer_question.casefold()) is expanded
+    if expanded:
+        assert search_questions == [
+            "What fee applies to early termination, including amount?",
+            "termination before expiration fee amount",
+            search_question,
+        ]
+    else:
+        assert search_questions == [search_question]
+
+
+def test_broad_terms_answer_uses_configured_alternate_model_after_validation_failure(session):
+    service, planner, _, _ = session
+    planner.return_value = plan_message(search_question="early termination terms")
+    service.model = ChatOllama(model="deepseek-r1:8b")
+    service.enumeration_model = ChatOllama(model="qwen3.5:4b")
+    service.search.answer = Mock(side_effect=[
+        DocumentQueryError(
+            "Focused answer validation failed stage=answer batch=1 "
+            "reason=missing_requested_facets after one corrective retry."
+        ),
+        AnswerResult("Complete facets [1]", [], {"model_requests": 1}),
+    ])
+
+    result = service.execute("What are the early termination terms?")
+
+    assert result.startswith("Complete facets [1]")
+    assert service.search.answer.call_count == 2
+    assert service.search.answer.call_args_list[0].args[1] is service.model
+    assert service.search.answer.call_args_list[1].args[1] is service.enumeration_model
+    assert service.previous_result.coverage["model_requests"] == 3
+    assert service.previous_result.coverage["answer_model_fallback"] == "qwen3.5:4b"
+
+
+def test_scoped_filename_is_removed_from_planner_search_question(session):
+    service, planner, _, _ = session
+    planner.return_value = plan_message(search_question="early termination terms in lease.txt")
+
+    plan = service.plan("What are early termination terms?")
+
+    assert plan.search_question == "early termination terms"
+    assert query.remove_scope_filenames(
+        "What are early termination terms in lease.txt?", ["lease.txt"],
+    ) == "What are early termination terms"
+
+
 def test_query_session_rejects_empty_scope_instead_of_resetting_to_all_documents(session):
     service, _, _, identifier = session
 

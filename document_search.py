@@ -16,8 +16,8 @@ from langchain_ollama import ChatOllama
 from app_logging import LOGGER, log_activity
 from document_library import DocumentLibrary, DocumentSnapshot, DocumentQueryError
 from document_answers import (
-    FOCUSED_SCHEMA, INFORMATION_ABSENCE, focused_schema, generate, parse_focused_findings,
-    truncation_retry_model,
+    FOCUSED_SCHEMA, INFORMATION_ABSENCE, SynthesisValidationError, focused_schema, generate,
+    parse_focused_findings, truncation_retry_model,
 )
 from document_progress import report_progress
 
@@ -27,7 +27,7 @@ PREFIX_BYTES = 200
 INDEX_SCHEMA = "passages-v1"
 MAX_QUERY_CHARS = 2000
 MAX_CONTEXT_CHARS = 12000
-MAX_PROMPT_BYTES = 6000
+MAX_PROMPT_BYTES = 8000
 RETRY_RESERVE_BYTES = 640
 NO_EVIDENCE = "No indexed document passages are available for the selected scope."
 DATE_QUESTION = re.compile(
@@ -51,6 +51,37 @@ FIELD_HEADING = re.compile(
 )
 QUESTION_WORDS = {"what", "which", "who", "where", "is", "are", "was", "were", "the", "a", "an",
                   "of", "for", "to", "in", "on", "at", "and", "or", "does", "do"}
+BROAD_FACET_FIELDS = re.compile(
+    r"(?im)^\s*(?:[-*]\s*)?(fee(?:/amount)?|notice\s+period|duration|conditions?|exceptions?)"
+    r"\s*:\s*(.+)$",
+)
+BROAD_ABSENCE = re.compile(
+    r"^\s*(?:not\s+(?:stated|specified|provided|established)|"
+    r"(?:the\s+)?supplied\s+passages\s+(?:do|does)\s+not\s+"
+    r"(?:state|specify|provide|establish)|no\s+(?:information|details?)\b)",
+    re.IGNORECASE,
+)
+BROAD_EVIDENCE = {
+    "fee": re.compile(
+        r"\b(?:fee|charge|penalt\w*)\b.*?"
+        r"(?:\$|\b(?:usd|dollars?)\b|\b(?:one|two|three|four|five|six|seven|eight|nine|ten|"
+        r"\d+)(?:\s*\(\s*\d+\s*\))?\s+months?['’]?\s+rent\b)",
+        re.IGNORECASE,
+    ),
+    "notice period": re.compile(r"\bnotice\b.{0,100}\b\d+\s+days?\b|\b\d+\s+days?\b.{0,100}\bnotice\b",
+                                re.IGNORECASE),
+    "duration": re.compile(r"\b(?:initial|renewal)\s+(?:\d+[- ]month\s+)?term\b",
+                            re.IGNORECASE),
+    "condition": re.compile(
+        r"\b(?:if|provided that|unless)\b.{0,120}\b(?:tenant|terminat\w*|vacat\w*|fee)\b",
+        re.IGNORECASE,
+    ),
+    "exception": re.compile(
+        r"\b(?:except(?:ion)?|unless|suspend\w*|holding over|beyond.{0,30}control|"
+        r"unable to give possession)\b",
+        re.IGNORECASE,
+    ),
+}
 
 
 def field_terms(text: str) -> set[str]:
@@ -124,9 +155,14 @@ ANSWER_PROMPT = ChatPromptTemplate.from_messages([
      "labels in support, then write text without inline citations. The application attaches "
      "the original passages; do not copy quotes into support. "
      "Use only facts from those passages, preserving the entity, field and conditions. "
-     "Do not repeat the same answer across findings. "
-     "A named list usually needs one finding, not one per item. "
-     "Answer every requested part: named specifics, conditions and conflict explanations. "
+     "Named lists need one finding, not one per item; avoid duplicate findings. "
+     "Answer every requested part, including specifics, conditions and conflicts. "
+     "Do not silently omit a requested detail: report its supported value or explicitly say "
+     "it is not established by the supplied passages, using wording scoped to those passages. "
+     "If a passage points to a value elsewhere (for example, 'below' or 'following') and that "
+     "value is not supplied, say it is not stated in the supplied passage. "
+     "For broad terms/conditions/requirements, cover requested fees, amounts, notice, duration, "
+     "conditions, and exceptions; state if absent from supplied passages. "
      "Preserve supported facts even if another part is unavailable. "
      "For a conflict, include a conclusion explaining how the values differ AND what "
      "the evidence says about precedence. Cite every passage used by that conclusion. "
@@ -509,14 +545,34 @@ class DocumentSearch:
                     term_date_matches.add(row["id"])
         for identifier in exact_matches | term_date_matches | heading_scores.keys():
             scores.setdefault(identifier, 0.0)
+        records = {row["id"]: json.loads(row["record"]) for row in rows}
+        continuation_scores: dict[str, float] = {}
+        for identifier, score in list(scores.items()):
+            record = records[identifier]
+            start = record["location"]["char_start"]
+            end = record["location"]["char_end"]
+            following = [
+                (other["location"]["char_start"], other_id)
+                for other_id, other in records.items()
+                if other["version_id"] == record["version_id"]
+                and other["segment"] == record["segment"]
+                and start < other["location"]["char_start"] <= end
+            ]
+            if following:
+                _, next_id = min(following)
+                continuation_scores[next_id] = max(
+                    continuation_scores.get(next_id, 0.0), score * 0.9,
+                )
+                scores.setdefault(next_id, 0.0)
         passages = []
         for identifier in sorted(
             scores, key=lambda item: (
                 item not in exact_matches, item not in term_date_matches,
-                -heading_scores.get(item, 0.0), -scores[item], item,
+                -heading_scores.get(item, 0.0), -continuation_scores.get(item, 0.0),
+                -scores[item], item,
             ),
         )[:limit]:
-            passage = json.loads(by_id[identifier]["record"])
+            passage = records[identifier]
             snapshot = by_version[passage["version_id"]]
             passage.pop("embedding_text")
             passage.update({
@@ -533,6 +589,64 @@ class DocumentSearch:
             LOGGER.debug("Hybrid date candidates term_date_matches=%d", len(term_date_matches))
         return {"passages": passages, "coverage": coverage}
 
+    def search_many(
+        self, questions: list[str], document_ids: list[str] | None = None, *, limit: int = 6,
+    ) -> dict:
+        if not questions:
+            raise DocumentQueryError("At least one search question is required.")
+        candidate_limit = limit if len(questions) == 1 else 10
+        results = [self.search(question, document_ids, limit=candidate_limit) for question in questions]
+        if len(results) == 1:
+            return results[0]
+
+        continuation_ids: set[str] = set()
+        for question, result in zip(questions, results):
+            if not re.search(r"\bterminat\w*\b", question, re.IGNORECASE):
+                continue
+            seed = next((
+                passage for passage in result["passages"]
+                if re.search(r"\b(?:fee|fees|charge|charges|penalty|penalties)\b",
+                             passage["text"], re.IGNORECASE)
+                and re.search(r"\bterminat\w*\b", passage["text"], re.IGNORECASE)
+            ), None)
+            current = seed
+            while current is not None:
+                location = current["location"]
+                following = [
+                    passage for passage in result["passages"]
+                    if passage["document_id"] == current["document_id"]
+                    and passage["version_id"] == current["version_id"]
+                    and passage["segment"] == current["segment"]
+                    and location["char_start"] < passage["location"]["char_start"]
+                    <= location["char_end"]
+                ]
+                if not following:
+                    break
+                current = min(following, key=lambda passage: passage["location"]["char_start"])
+                continuation_ids.add(current["id"])
+
+        passages = []
+        seen_ids: set[str] = set()
+        seen_segments: set[tuple[str, int, int]] = set()
+        for one_per_segment in (True, False):
+            for offset in range(max(len(result["passages"]) for result in results)):
+                for result in results:
+                    if offset >= len(result["passages"]):
+                        continue
+                    passage = result["passages"][offset]
+                    segment = (passage["document_id"], passage["version_id"], passage["segment"])
+                    if (passage["id"] in seen_ids
+                            or (one_per_segment and segment in seen_segments
+                                and passage["id"] not in continuation_ids)):
+                        continue
+                    seen_ids.add(passage["id"])
+                    seen_segments.add(segment)
+                    passages.append(passage)
+        merged = dict(results[-1])
+        merged["passages"] = passages[:limit]
+        merged["coverage"] = dict(merged["coverage"], query_variants=len(results))
+        return merged
+
     @log_activity("Personal document answer")
     def ask(
         self, question: str, model: Runnable, document_ids: list[str] | None = None, *, limit: int = 6,
@@ -543,10 +657,12 @@ class DocumentSearch:
     def answer(
         self, question: str, model: Runnable, document_ids: list[str] | None = None,
         *, limit: int = 6, search_question: str | None = None,
+        search_questions: list[str] | None = None,
     ) -> AnswerResult:
         report_progress("retrieving evidence")
         question = validate_question(question, limit)
-        result = self.search(search_question or question, document_ids, limit=limit)
+        queries = search_questions or [search_question or question]
+        result = self.search_many(queries, document_ids, limit=limit)
         passages = filter_address_name_field_distractors(question, result["passages"])
         excluded_name_fields = len(result["passages"]) - len(passages)
         if not passages:
@@ -572,12 +688,55 @@ class DocumentSearch:
             reasoning = model.model.split(":")[0] == "deepseek-r1"
             model = model.bind(reasoning=reasoning, format=schema)
         stats = {"requests": 0}
+
+        def parse_answer(text: str) -> str:
+            rendered = parse_focused_findings(text, evidence, 12000)
+            if re.search(r"\b(?:terms|conditions|requirements)\b", question, re.IGNORECASE):
+                facets = {
+                    "fee": r"\bfees?\b",
+                    "amount": (
+                        r"\bamounts?\b|\$\s*\d|\b(?:one|two|three|four|five|six|seven|eight|nine|ten|"
+                        r"\d+)(?:\s*\(\s*\d+\s*\))?\s+(?:months?|weeks?)"
+                        r"\s*['’]?\s*(?:of\s+)?rent\b"
+                    ),
+                    "notice": r"\bnotice\b",
+                    "period": r"\bperiods?\b",
+                    "duration": r"\bduration\b",
+                    "condition": r"\bconditions?\b",
+                    "exception": r"\bexceptions?\b",
+                }
+                missing_facets = [
+                    facet for facet, pattern in facets.items()
+                    if not re.search(pattern, rendered, re.IGNORECASE)
+                ]
+                if missing_facets:
+                    raise SynthesisValidationError(
+                        "missing_requested_facets:" + ",".join(missing_facets)
+                    )
+                facet_aliases = {
+                    "fee": "fee", "fee/amount": "fee", "notice period": "notice period",
+                    "duration": "duration", "condition": "condition", "conditions": "condition",
+                    "exception": "exception", "exceptions": "exception",
+                }
+                for finding in json.loads(text)["findings"]:
+                    for match in BROAD_FACET_FIELDS.finditer(finding["text"]):
+                        facet = facet_aliases[match.group(1).casefold()]
+                        if (BROAD_ABSENCE.match(match.group(2))
+                                and any(
+                                    BROAD_EVIDENCE[facet].search(record["text"])
+                                    and (facet != "fee" or re.search(
+                                        r"\bterminat\w*\b", record["text"], re.IGNORECASE,
+                                    ))
+                                    for record in evidence
+                                )):
+                            raise SynthesisValidationError("unsupported_facet_absence")
+            return rendered
+
         answer = generate(
             model, prompt, set(range(1, len(evidence) + 1)), 12000,
             stage="answer", batch=1, stats=stats, operation="Focused answer",
             max_findings=FOCUSED_SCHEMA["properties"]["findings"]["maxItems"],
-            response_parser=lambda text: parse_focused_findings(
-                text, evidence, 12000),
+            response_parser=parse_answer,
             max_prompt_bytes=MAX_PROMPT_BYTES,
             truncated_retry_model=truncation_retry_model(model),
         )

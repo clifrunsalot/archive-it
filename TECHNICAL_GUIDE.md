@@ -206,8 +206,9 @@ The field-heading heuristic:
 - Gives uncommon heading terms more weight than repeated generic terms.
 - Accounts for heading length. `LANDLORD:` beats a partial match such as
   `Landlord or Agent's Name:`.
-- Gives the next overlapping passage a smaller preference so a list can
-  continue beyond its heading.
+- Gives the immediately following overlapping passage a smaller preference
+  when a passage ranks, preserving nearby clause context and helping lists or
+  conditions continue beyond a chunk boundary.
 
 For address questions, a matching party heading with a street address can
 exclude name-only absence notes and other parties' address fields from model
@@ -215,7 +216,25 @@ input.
 
 These are narrow heuristics, not address extraction or semantic guarantees.
 They use existing passages; no rebuild is needed. A passage limit is not a
-completeness measure.
+completeness measure, and the following passage may still not contain every
+related term or condition.
+
+Broad focused questions asking for document "terms", "conditions", or
+"requirements" add targeted fee-and-amount searches alongside the main query
+(including an "ends before expiration" variant for termination questions).
+Related overlapping chunks from termination-fee results are retained ahead of
+unrelated source segments, while the broader results still favor distinct
+segments. The model is also
+asked to cover notice periods, duration, conditions, and exceptions where
+supported, and to identify requested details that are not established by the
+supplied passages. This improves discovery and makes gaps more explicit, but
+does not make retrieval exhaustive. The focused answer prompt allows up to
+8,000 bytes to fit more adjacent clause passages while remaining bounded.
+The answer is requested as five labeled fields (fee/amount, notice period,
+duration, conditions, and exceptions). If validation rejects the default
+answer model for a broad terms question, the configured alternate
+(`--enumeration-model`, Qwen by default) gets one attempt; failed validation
+still blocks publication.
 
 #### Focused-answer evidence and validation
 

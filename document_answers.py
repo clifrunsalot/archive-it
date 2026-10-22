@@ -172,7 +172,7 @@ INFORMATION_ABSENCE = re.compile(
     r"(?:record|provide|specify|state|list|mention)\b", re.IGNORECASE,
 )
 LOCAL_SCOPE = re.compile(
-    r"\b(?:field|section|block|passage|addendum|clause)\b|\bsupplied evidence\b|"
+    r"\b(?:field|section|block|passages?|addendum|clause)\b|\bsupplied evidence\b|"
     r"\b(?:here|in this (?:contact|name|mailing) (?:listing|block|field))\b",
     re.IGNORECASE,
 )
@@ -333,6 +333,18 @@ def generate(
                     "or clause. If another supplied passage gives the requested value, answer "
                     "with that value and do not infer that it is missing from a different field. "
                     "Return no_relevant_evidence only if supplied passages cannot answer."
+                )
+            if str(error).startswith("missing_requested_facets"):
+                correction += (
+                    " Cover every requested facet. For each missing detail, use the exact wording "
+                    "'not stated in the supplied passages'; cite the relevant passage. Preserve "
+                    "supported facts and do not infer."
+                )
+            if str(error) == "unsupported_facet_absence":
+                correction += (
+                    " A supplied passage contains a requested facet you marked absent. Include its "
+                    "supported detail and cite that passage; use 'not stated in the supplied "
+                    "passages' only when no supplied passage states the facet."
                 )
             if not allow_no_relevant:
                 correction += " Relevant input notes exist; preserve their findings, not a no-relevant result."

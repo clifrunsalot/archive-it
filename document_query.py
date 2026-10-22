@@ -82,7 +82,8 @@ PLAN_PROMPT = ChatPromptTemplate.from_messages([
      "For an ordinary follow-up preserve the prior presentation unless the user changes it; "
      "use prose for a new standalone topic without an explicit format. "
      "search_question must express just the factual search intent without formatting demands "
-     "and stay within 512 characters. Represent date/tag/party/version filters in filters; "
+     "and stay within 512 characters. Selected filenames are scope metadata, not search terms. "
+     "Represent date/tag/party/version filters in filters; "
      "fact_query/aggregate have a separate fact planner for inclusive date bounds only. "
      "do not pretend unsupported filters are implemented. "
      "clarification is null except when information is needed; then ask one focused question."),
@@ -98,6 +99,45 @@ class QueryPlan:
     presentation: Presentation
     clarification: str | None
     filters: list[str]
+
+
+def remove_scope_filenames(search_question: str, filenames: list[str]) -> str:
+    for filename in filenames:
+        for value in dict.fromkeys((filename, Path(filename).stem)):
+            if re.search(re.escape(value), search_question, flags=re.IGNORECASE):
+                search_question = re.sub(
+                    re.escape(value), " ", search_question, flags=re.IGNORECASE,
+                )
+                search_question = re.sub(r"[?!.;,]+\s*$", "", search_question).rstrip()
+                search_question = re.sub(
+                    r"\s+\b(?:in|from|about|of|for|named|called)\s*$", "", search_question,
+                    flags=re.IGNORECASE,
+                )
+    return " ".join(search_question.split())
+
+
+def expand_broad_terms_search(question: str, search_question: str) -> tuple[str, list[str]]:
+    if not re.search(r"\b(?:terms|conditions|requirements)\b", question, re.IGNORECASE):
+        return search_question, [search_question]
+    topic = re.sub(
+        r"^\s*(?:(?:what|which)\s+(?:are|is)|(?:tell|explain|describe)\s+me|list)\s+",
+        "", question, flags=re.IGNORECASE,
+    )
+    topic = re.sub(r"^\s*(?:the|a|an)\s+", "", topic, flags=re.IGNORECASE)
+    topic = re.sub(
+        r"\s+\b(?:terms|conditions|requirements)\b.*$", "", topic, flags=re.IGNORECASE,
+    ).strip(" ?.!;:")
+    topic = topic or "the topic"
+    answer_question = (
+        f"{question.strip()} Answer in five labeled fields: Fee/amount, notice period, "
+        "duration, conditions, and exceptions. For each, give the supported detail or state "
+        "that it is not stated in the supplied passages; cite every supporting passage."
+    )
+    search_questions = [f"What fee applies to {topic}, including amount?"]
+    if re.search(r"\bterminat\w*\b", topic, re.IGNORECASE):
+        search_questions.append("termination before expiration fee amount")
+    search_questions.append(search_question)
+    return answer_question, search_questions
 
 
 def get_planner(model: str = REWRITE_MODEL) -> Runnable:
@@ -257,10 +297,16 @@ class QuerySession:
             raw_plan["search_question"] = question
             plan_text = json.dumps(raw_plan)
         plan = parse_plan(plan_text, allowed)
-        if presentation is not None:
-            plan.presentation = presentation
         if plan.document_ids is None:
             plan.document_ids = self.document_ids[:] if self.document_ids else None
+        if plan.document_ids:
+            filenames = [
+                Path(snapshot.source_path).name for snapshot in snapshots
+                if snapshot.document_id in plan.document_ids
+            ]
+            plan.search_question = remove_scope_filenames(plan.search_question, filenames)
+        if presentation is not None:
+            plan.presentation = presentation
         # Guard the motivating corpus-wide ranking even if a model calls it an explanation.
         if re.search(r"\b(?:most|fewest|highest|lowest)\s+(?:\w+\s+)?(?:warnings|receipts|expenses|faults)\b",
                      question, re.IGNORECASE):
@@ -350,13 +396,18 @@ class QuerySession:
         snapshots = self.search.library.snapshots(plan.document_ids)
         versions = {snapshot.document_id: (snapshot.version_id, snapshot.latest_attempt_status)
                     for snapshot in snapshots}
+        answer_question, search_questions = (
+            expand_broad_terms_search(question, plan.search_question)
+            if plan.intent in {"search", "explain", "extract_fact"}
+            else (plan.search_question, [plan.search_question])
+        )
         if plan.intent in ("summarize", "compare", "enumerate"):
             from document_synthesis import synthesize
             operation_model = self.enumeration_model if plan.intent == "enumerate" else self.model
             result = synthesize(self.search.library, operation_model, plan.intent,
                                 plan.search_question, plan.document_ids)
         elif plan.intent == "search":
-            found = self.search.search(plan.search_question, plan.document_ids, limit=self.limit)
+            found = self.search.search_many(search_questions, plan.document_ids, limit=self.limit)
             evidence = [dict(record, label=index)
                         for index, record in enumerate(found["passages"], 1)]
             result = AnswerResult(
@@ -364,10 +415,29 @@ class QuerySession:
                 or "No indexed passages are available.", evidence, found["coverage"],
             )
         else:
-            result = self.search.answer(
-                plan.search_question, self.model, plan.document_ids,
-                limit=self.limit, search_question=plan.search_question,
-            )
+            try:
+                result = self.search.answer(
+                    answer_question, self.model, plan.document_ids,
+                    limit=self.limit, search_questions=search_questions,
+                )
+            except DocumentQueryError as error:
+                fallback_model = self.enumeration_model
+                if not (
+                    re.search(r"\b(?:terms|conditions|requirements)\b", question, re.IGNORECASE)
+                    and "validation failed stage=answer batch=1" in str(error)
+                    and model_name(fallback_model) != model_name(self.model)
+                ):
+                    raise
+                LOGGER.warning(
+                    "Broad-term answer validation failed; retrying with configured alternate model=%s",
+                    model_name(fallback_model),
+                )
+                result = self.search.answer(
+                    answer_question, fallback_model, plan.document_ids,
+                    limit=self.limit, search_questions=search_questions,
+                )
+                result.coverage["model_requests"] = result.coverage.get("model_requests", 0) + 2
+                result.coverage["answer_model_fallback"] = model_name(fallback_model)
         self.previous_plan = plan
         self.previous_result = result
         self.document_ids = plan.document_ids

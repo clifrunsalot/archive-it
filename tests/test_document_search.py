@@ -142,6 +142,92 @@ def test_which_question_prefers_specific_heading_and_overlapping_continuation(tm
     assert all(record["document_id"] == identifier for record in found["passages"])
 
 
+def test_focused_search_includes_immediately_following_clause_chunk(tmp_path):
+    store = library.DocumentLibrary(tmp_path / "catalogue.sqlite3")
+    path = tmp_path / "termination.txt"
+    path.write_text(
+        "Early termination requires written notice. "
+        + "Ordinary rental obligations remain in force. " * 10
+        + "A charge equal to two months of rent is due. "
+        + "General provisions apply to all parties. " * 30
+    )
+    identifier = store.ingest(path)
+    engine = search.DocumentSearch(store, ConceptEmbeddings(), "synthetic-v1")
+    engine.index([identifier])
+
+    result = engine.search("early termination", [identifier], limit=2)
+
+    assert any("two months of rent" in passage["text"] for passage in result["passages"])
+
+
+def test_search_many_prioritizes_unique_segments_before_overlapping_chunks(indexed, monkeypatch):
+    _, engine, ids = indexed
+
+    def passage(identifier, segment, text=""):
+        return {
+            "id": identifier, "document_id": ids[0], "version_id": 1, "segment": segment,
+            "text": text,
+        }
+
+    fee_results = {
+        "passages": [passage("fee-1", 1), passage("fee-3", 3), passage("fee-3b", 3),
+                     passage("fee-4", 4)],
+        "coverage": {"query": "fee"},
+    }
+    main_results = {
+        "passages": [passage("main-1", 1), passage("main-2", 2), passage("main-2b", 2),
+                     passage("main-4", 4)],
+        "coverage": {"query": "main"},
+    }
+    search = Mock(side_effect=[fee_results, main_results])
+    monkeypatch.setattr(engine, "search", search)
+
+    result = engine.search_many(["fee", "main"], ids[:1], limit=4)
+
+    assert [row["id"] for row in result["passages"]] == [
+        "fee-1", "fee-3", "main-2", "fee-4",
+    ]
+    assert result["coverage"] == {"query": "main", "query_variants": 2}
+
+
+def test_search_many_keeps_termination_fee_continuations_ahead_of_other_segments(indexed, monkeypatch):
+    _, engine, ids = indexed
+
+    def passage(identifier, segment, start, end, text):
+        return {
+            "id": identifier, "document_id": ids[0], "version_id": 1, "segment": segment,
+            "text": text, "location": {"char_start": start, "char_end": end},
+        }
+
+    fee_results = {
+        "passages": [
+            passage("clause-1", 11, 1269, 1668, "early termination fee"),
+            passage("clause-2", 11, 1588, 1983, "fee schedule continuation"),
+            passage("clause-3", 11, 1903, 2302, "amount table continuation"),
+            passage("unrelated-fee", 6, 636, 1036, "monthly fee $1200"),
+        ],
+        "coverage": {"query": "early termination fee amount"},
+    }
+    main_results = {
+        "passages": [
+            passage("main-1", 5, 640, 1038, "notice period"),
+            passage("main-2", 7, 958, 1350, "renewal term"),
+            passage("main-3", 8, 1276, 1671, "conditions"),
+            passage("main-4", 9, 5060, 5459, "general fee"),
+        ],
+        "coverage": {"query": "early termination terms"},
+    }
+    monkeypatch.setattr(engine, "search", Mock(side_effect=[fee_results, main_results]))
+
+    result = engine.search_many(
+        ["early termination fee amount", "early termination terms"], ids[:1], limit=6,
+    )
+
+    identifiers = [row["id"] for row in result["passages"]]
+    assert identifiers[:5] == ["clause-1", "main-1", "clause-2", "main-2", "clause-3"]
+    assert "unrelated-fee" not in identifiers
+
+
 @pytest.fixture
 def indexed(tmp_path):
     store = library.DocumentLibrary(tmp_path / "catalogue.sqlite3")
@@ -573,6 +659,68 @@ def test_bad_source_reference_can_be_corrected_without_leaking_rejected_output(i
     assert "SECRET" not in caplog.text
     assert "SECRET" not in model.call_args.args[0].to_string()
     assert "Select supplied integer source labels" in model.call_args.args[0].to_string()
+
+
+def test_broad_terms_answer_retries_when_requested_facets_are_omitted(indexed):
+    _, engine, ids = indexed
+    model = Mock(side_effect=[
+        findings_message("Tenant may terminate with 30 days' notice."),
+        findings_message(
+            "Fee amount, duration, conditions, and exceptions are not stated in the supplied "
+            "passages. The notice period is 30 days."
+        ),
+    ])
+    question = (
+        "What are the early termination terms? Include applicable fee amounts, notice periods, "
+        "duration, conditions, and exceptions where stated."
+    )
+
+    result = engine.answer(question, RunnableLambda(model), ids[:1])
+
+    assert result.coverage["model_requests"] == 2
+    assert all(facet in result.answer.casefold() for facet in (
+        "fee", "amount", "notice", "period", "duration", "condition", "exception",
+    ))
+    assert "Cover every requested facet" in model.call_args.args[0].to_string()
+
+
+def test_broad_terms_answer_retries_when_it_marks_evidenced_facets_absent(indexed, tmp_path):
+    store, engine, _ = indexed
+    path = tmp_path / "early-termination.txt"
+    path.write_text(
+        "If the Tenant terminates during the initial 12-month term, a fee equal to two (2) "
+        "months' rent is due."
+    )
+    identifier = store.ingest(path)
+    engine.index([identifier])
+    model = Mock(side_effect=[
+        findings_message(
+            "Fee/amount: Not stated in the supplied passages. "
+            "Notice period: Not stated in the supplied passages. "
+            "Duration: Not stated in the supplied passages. "
+            "Conditions: Not stated in the supplied passages. "
+            "Exceptions: Not stated in the supplied passages."
+        ),
+        findings_message(
+            "Fee/amount: Two months' rent. "
+            "Notice period: Not stated in the supplied passages. "
+            "Duration: Initial 12-month term. "
+            "Conditions: If the Tenant terminates during the term, the fee is due. "
+            "Exceptions: Not stated in the supplied passages."
+        ),
+    ])
+
+    result = engine.answer(
+        "What are the early termination terms? Include fees, notice period, duration, "
+        "conditions, and exceptions.",
+        RunnableLambda(model),
+        [identifier],
+    )
+
+    assert result.coverage["model_requests"] == 2
+    assert "Two months' rent" in result.answer
+    assert "A supplied passage contains a requested facet" in model.call_args.args[0].to_string()
+
 
 @pytest.mark.parametrize("count", [4, 8])
 def test_focused_answer_accepts_entire_advertised_findings_limit(indexed, count):
